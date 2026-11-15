@@ -7,6 +7,7 @@ import re
 import threading
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import quote
 
 from pymongo import MongoClient, ReturnDocument
 from telegram import (
@@ -78,7 +79,9 @@ ITEMS = {
     ),
     "check": ("Tekshirish tugmasi", "✅ Tekshirish", False, "b"),
     "watch": ("Tomosha qilish tugmasi", "✨Tomosha Qilish✨", False, "b"),
+    "share": ("Ulashish tugmasi", "↗️ Ulashish", False, "b"),
 }
+BOT_USERNAME = ""
 DEFAULT_START = "Salom! Kino nomini yoki kodini yozing, men topib beraman."
 
 
@@ -113,10 +116,12 @@ def is_admin(uid: int) -> bool:
 
 
 def next_code() -> int:
-    doc = counters.find_one_and_update(
-        {"_id": "movies"}, {"$inc": {"n": 1}}, upsert=True, return_document=ReturnDocument.AFTER
-    )
-    return doc["n"]
+    while True:
+        doc = counters.find_one_and_update(
+            {"_id": "movies"}, {"$inc": {"n": 1}}, upsert=True, return_document=ReturnDocument.AFTER
+        )
+        if not movies.find_one({"code": doc["n"]}):
+            return doc["n"]
 
 
 def touch_user(update: Update):
@@ -238,27 +243,72 @@ async def gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE, code: int = 0) ->
 
 
 # ============================== KINO YUBORISH ==============================
-async def deliver(bot, chat_id: int, uid: int, code: int, premium: bool):
-    m = movies.find_one({"code": code})
-    if not m or not CHANNEL_ID:
-        await bot.send_message(chat_id, T("code_not_found"), parse_mode=HTML)
-        return
+def movie_parts(m) -> list:
+    return list(m.get("parts") or ([m["message_id"]] if m.get("message_id") else []))
+
+
+def movie_label(m) -> str:
+    n = len(movie_parts(m))
+    return f"{m['code']}. {m['title']}" + (f" ({n} qism)" if n > 1 else "")
+
+
+def share_markup(bot, code: int, title: str):
+    link = f"https://t.me/{bot.username}?start={code}"
+    url = "https://t.me/share/url?url=" + quote(link, safe="") + "&text=" + quote(title, safe="")
+    return Markup([[Btn(T("share"), url=url)]])
+
+
+async def send_parts(bot, chat_id: int, uid: int, m: dict, premium: bool):
+    parts = movie_parts(m)
+    n = len(parts)
     protect = S["protect_premium"] if premium else S["protect_regular"]
-    caption = m["title"]
-    if T("caption_channel"):
-        caption += f"\nKanal: {T('caption_channel')}"
-    try:
-        await bot.copy_message(
-            chat_id=chat_id,
-            from_chat_id=CHANNEL_ID,
-            message_id=m["message_id"],
-            caption=caption,
-            protect_content=protect,
-        )
-        downloads.insert_one({"user": uid, "code": code, "at": now()})
-    except TelegramError as e:
-        log.error("Kino yuborilmadi (%s): %s", code, e)
-        await bot.send_message(chat_id, "Kinoni yuborib bo'lmadi, keyinroq urinib ko'ring.")
+    sent = 0
+    for i, mid in enumerate(parts, 1):
+        caption = m["title"] if n == 1 else f"{m['title']} {i}-qism"
+        if T("caption_channel"):
+            caption += f"\nKanal: {T('caption_channel')}"
+        markup = share_markup(bot, m["code"], m["title"]) if i == n else None
+        for _ in range(3):
+            try:
+                await bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=CHANNEL_ID,
+                    message_id=mid,
+                    caption=caption,
+                    protect_content=protect,
+                    reply_markup=markup,
+                )
+                sent += 1
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except Forbidden:
+                return
+            except TelegramError as e:
+                log.error("Qism yuborilmadi (%s, %s-qism): %s", m["code"], i, e)
+                break
+        if i < n:
+            await asyncio.sleep(0.8)
+    if sent:
+        downloads.insert_one({"user": uid, "code": m["code"], "at": now()})
+    else:
+        try:
+            await bot.send_message(chat_id, "Kinoni yuborib bo'lmadi, keyinroq urinib ko'ring.")
+        except TelegramError:
+            pass
+
+
+async def deliver(ctx, chat_id: int, uid: int, code: int, premium: bool):
+    m = movies.find_one({"code": code})
+    if not m or not CHANNEL_ID or not movie_parts(m):
+        await ctx.bot.send_message(chat_id, T("code_not_found"), parse_mode=HTML)
+        return
+    n = len(movie_parts(m))
+    if n > 1:
+        await ctx.bot.send_message(chat_id, f"{m['title']}: {n} ta qism yuborilmoqda...")
+        ctx.application.create_task(send_parts(ctx.bot, chat_id, uid, m, premium))
+    else:
+        await send_parts(ctx.bot, chat_id, uid, m, premium)
 
 
 async def send_start(bot, chat_id: int, uid: int):
@@ -278,14 +328,18 @@ async def user_text(update: Update, ctx, text: str, doc):
     chat_id = update.effective_chat.id
     uid = update.effective_user.id
     if text.isdigit():
-        await deliver(ctx.bot, chat_id, uid, int(text), bool(doc.get("is_premium")))
+        await deliver(ctx, chat_id, uid, int(text), bool(doc.get("is_premium")))
         return
     q = text.casefold()
     found = [m for m in movies.find().sort("code", 1) if q in m["title"].casefold()][:30]
     if not found:
         await update.message.reply_text(T("not_found"), parse_mode=HTML)
         return
-    rows = [[Btn(m["title"][:60], callback_data=f"m:{m['code']}")] for m in found]
+    rows = [
+        [Btn((m["title"] + (f" ({len(movie_parts(m))} qism)" if len(movie_parts(m)) > 1 else ""))[:60],
+             callback_data=f"m:{m['code']}")]
+        for m in found
+    ]
     await update.message.reply_text(T("found_list"), parse_mode=HTML, reply_markup=Markup(rows))
 
 
@@ -301,7 +355,7 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await gate(update, ctx, code):
         return
     if code:
-        await deliver(ctx.bot, update.effective_chat.id, uid, code, bool(doc.get("is_premium")))
+        await deliver(ctx, update.effective_chat.id, uid, code, bool(doc.get("is_premium")))
     else:
         await send_start(ctx.bot, update.effective_chat.id, uid)
 
@@ -355,7 +409,7 @@ async def on_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.send_message(chat_id, "⚠️ Videoga kino nomini caption qilib yozing.")
         return
     code = next_code()
-    movies.insert_one({"code": code, "title": title, "message_id": post.message_id, "created": now()})
+    movies.insert_one({"code": code, "title": title, "parts": [post.message_id], "created": now()})
     link = f"https://t.me/{ctx.bot.username}?start={code}"
     await ctx.bot.send_message(
         chat_id,
@@ -393,10 +447,10 @@ async def v_movies(update):
     n = movies.count_documents({})
     await show(
         update,
-        f"🎬 <b>Kinolar bo'limi</b>\n\nBazada: {n} ta kino\n\n"
-        "<i>Yangi kino qo'shish uchun videoni baza kanalga caption (nomi) bilan tashlang.</i>",
+        f"🎬 <b>Kinolar bo'limi</b>\n\nBazada: {n} ta kino",
         Markup(
             [
+                [Btn("➕ Kino qo'shish", callback_data="mv:add")],
                 [Btn("📋 Ro'yxat", callback_data="mv:l:0"), Btn("🔍 Qidirish", callback_data="mv:s")],
                 [Btn("◀️ Orqaga", callback_data="a:home")],
             ]
@@ -410,7 +464,7 @@ async def v_movie_list(update, page: int):
     pages = pages_of(total, per)
     page = max(0, min(page, pages - 1))
     docs = list(movies.find().sort("code", -1).skip(page * per).limit(per))
-    rows = [[Btn(f"{m['code']}. {m['title']}"[:60], callback_data=f"mv:c:{m['code']}")] for m in docs]
+    rows = [[Btn(movie_label(m)[:60], callback_data=f"mv:c:{m['code']}")] for m in docs]
     rows.append(paginate_nav("mv:l", page, pages))
     rows.append([Btn("◀️ Orqaga", callback_data="mv:home")])
     await show(update, f"📋 <b>Kinolar ro'yxati</b>\nJami: {total} ta", Markup(rows))
@@ -421,18 +475,26 @@ async def v_movie_card(update, code: int):
     if not m:
         await show(update, "Kino topilmadi.", Markup([[Btn("◀️ Orqaga", callback_data="mv:l:0")]]))
         return
+    n = len(movie_parts(m))
     dl = downloads.count_documents({"code": code})
+    kind = f"Serial, {n} qism" if n > 1 else "Kino"
+    rows = [
+        [Btn("➕ Qism qo'shish", callback_data=f"mv:ap:{code}")],
+        [
+            Btn("✏️ Nomi", callback_data=f"mv:r:{code}"),
+            Btn("🔢 Kodi", callback_data=f"mv:cc:{code}"),
+        ],
+    ]
+    if n > 1:
+        rows.append([Btn("🗑 Qismni o'chirish", callback_data=f"mv:pd:{code}")])
+    rows.append([Btn("🗑 Hammasini o'chirish", callback_data=f"mv:d:{code}")])
+    rows.append([Btn("◀️ Orqaga", callback_data="mv:l:0")])
     await show(
         update,
-        f"🎬 <b>{esc(m['title'])}</b>\n\nKod: <code>{code}</code>\nQo'shilgan: {fmt_dt(m.get('created'))}\n"
-        f"Yuklanishlar: {dl} ta",
-        Markup(
-            [
-                [Btn("✏️ Nomini o'zgartirish", callback_data=f"mv:r:{code}")],
-                [Btn("🗑 O'chirish", callback_data=f"mv:d:{code}")],
-                [Btn("◀️ Orqaga", callback_data="mv:l:0")],
-            ]
-        ),
+        f"🎬 <b>{esc(m['title'])}</b>\n\nTuri: {kind}\nKod: <code>{code}</code>\n"
+        f"Havola: https://t.me/{BOT_USERNAME}?start={code}\n"
+        f"Qo'shilgan: {fmt_dt(m.get('created'))}\nYuklanishlar: {dl} ta",
+        Markup(rows),
     )
 
 
@@ -453,7 +515,7 @@ async def cb_mv(update, ctx, p):
     elif a == "d":
         await show(
             update,
-            "Rostdan ham o'chirasizmi?\n\n<i>Kino botdan o'chadi, baza kanaldagi video esa qoladi.</i>",
+            "Rostdan ham o'chirasizmi?\n\n<i>Kino (hamma qismlari bilan) botdan o'chadi, baza kanaldagi videolar esa qoladi.</i>",
             Markup(
                 [
                     [Btn("✅ Ha, o'chirish", callback_data=f"mv:dy:{p[2]}")],
@@ -464,6 +526,66 @@ async def cb_mv(update, ctx, p):
     elif a == "dy":
         movies.delete_one({"code": int(p[2])})
         await v_movie_list(update, 0)
+    elif a == "add":
+        if not CHANNEL_ID:
+            await show(
+                update,
+                "❌ Avval baza kanalni sozlang: Render'da <code>CHANNEL_ID</code> ni kiriting.",
+                Markup([[Btn("◀️ Orqaga", callback_data="mv:home")]]),
+            )
+            return
+        ctx.user_data["up"] = {"ids": [], "status": None, "code": None, "title": None}
+        ctx.user_data["st"] = {"k": "up_title"}
+        await show(
+            update,
+            "➕ <b>Kino qo'shish</b>\n\nKino (yoki serial) nomini yozing.\nMasalan: <code>Agarda</code>",
+            CANCEL_KB,
+        )
+    elif a == "ap":
+        code = int(p[2])
+        m = movies.find_one({"code": code})
+        if not m or not CHANNEL_ID:
+            await v_movies(update)
+            return
+        ctx.user_data["up"] = {"ids": [], "status": None, "code": code, "title": m["title"]}
+        ctx.user_data["st"] = {"k": "up_files"}
+        await show(
+            update,
+            f"➕ <b>{esc(m['title'])}</b> ga qism qo'shish\n\nVideolarni yuboring. Ular oxirgi qismdan keyin qo'shiladi.",
+            CANCEL_KB,
+        )
+    elif a == "cc":
+        ctx.user_data["st"] = {"k": "mv_code", "code": int(p[2])}
+        await show(
+            update,
+            "🔢 Yangi kodni (faqat raqam) yozing:",
+            Markup([[Btn("◀️ Orqaga", callback_data=f"mv:c:{p[2]}")]]),
+        )
+    elif a == "pd":
+        code = int(p[2])
+        m = movies.find_one({"code": code})
+        n = len(movie_parts(m)) if m else 0
+        btns = [Btn(f"🗑 {i + 1}", callback_data=f"mv:px:{code}:{i}") for i in range(n)]
+        rows = [btns[i : i + 5] for i in range(0, len(btns), 5)]
+        rows.append([Btn("◀️ Orqaga", callback_data=f"mv:c:{code}")])
+        await show(
+            update,
+            "Qaysi qismni o'chiramiz?\n\n<i>Video baza kanalda qoladi, faqat botdan olinadi.</i>",
+            Markup(rows),
+        )
+    elif a == "px":
+        code, idx = int(p[2]), int(p[3])
+        m = movies.find_one({"code": code})
+        if m:
+            parts = movie_parts(m)
+            if 0 <= idx < len(parts):
+                parts.pop(idx)
+            if parts:
+                movies.update_one({"code": code}, {"$set": {"parts": parts}, "$unset": {"message_id": ""}})
+                await v_movie_card(update, code)
+            else:
+                movies.delete_one({"code": code})
+                await v_movie_list(update, 0)
 
 
 STATES = {}
@@ -492,7 +614,7 @@ async def s_mv_search(update, ctx, st):
         await update.message.reply_text("Hech narsa topilmadi.")
         await v_movies(update)
         return
-    rows = [[Btn(f"{m['code']}. {m['title']}"[:60], callback_data=f"mv:c:{m['code']}")] for m in found]
+    rows = [[Btn(movie_label(m)[:60], callback_data=f"mv:c:{m['code']}")] for m in found]
     rows.append([Btn("◀️ Orqaga", callback_data="mv:home")])
     await update.message.reply_text("Topilganlar:", reply_markup=Markup(rows))
 
@@ -506,6 +628,155 @@ async def s_mv_rename(update, ctx, st):
     ctx.user_data.pop("st", None)
     await update.message.reply_text("✅ Nomi o'zgartirildi.")
     await v_movie_card(update, st["code"])
+
+
+@state("mv_code")
+async def s_mv_code(update, ctx, st):
+    t = (update.message.text or "").strip()
+    if not t.isdigit():
+        await update.message.reply_text("❌ Faqat raqam yozing.")
+        return
+    new, old = int(t), st["code"]
+    if new != old:
+        if movies.find_one({"code": new}):
+            await update.message.reply_text("❌ Bu kod band. Boshqa raqam yozing.")
+            return
+        movies.update_one({"code": old}, {"$set": {"code": new}})
+        downloads.update_many({"code": old}, {"$set": {"code": new}})
+    ctx.user_data.pop("st", None)
+    await update.message.reply_text("✅ Kod o'zgartirildi.")
+    await v_movie_card(update, new)
+
+
+# ---------- Botning o'zida kino yuklash ----------
+CANCEL_KB = Markup([[Btn("❌ Bekor qilish", callback_data="up:cancel")]])
+
+
+def up_view(up):
+    n = len(up["ids"])
+    extra = "\n<i>Bir nechta video: serial bo'lib, bitta kodga yig'iladi.</i>" if n > 1 else ""
+    text = (
+        f"🎬 <b>{esc(up['title'])}</b>\n\nQabul qilindi: <b>{n} ta</b> video{extra}\n\n"
+        "Yana video yuboring yoki tugmani bosing."
+    )
+    kb = Markup(
+        [
+            [Btn("✅ Tayyor", callback_data="up:done")],
+            [Btn("↩️ Oxirgisini o'chirish", callback_data="up:undo")],
+            [Btn("❌ Bekor qilish", callback_data="up:cancel")],
+        ]
+    )
+    return text, kb
+
+
+async def up_cleanup(bot, up):
+    for mid in up.get("ids", []):
+        try:
+            await bot.delete_message(CHANNEL_ID, mid)
+        except TelegramError:
+            pass
+
+
+@state("up_title")
+async def s_up_title(update, ctx, st):
+    t = (update.message.text or "").strip()
+    if not t:
+        await update.message.reply_text("Kino nomini matn bilan yozing.")
+        return
+    ctx.user_data["up"]["title"] = t
+    ctx.user_data["st"] = {"k": "up_files"}
+    await update.message.reply_text(
+        f"🎬 {t}\n\nEndi videolarni yuboring (bir yoki bir nechta, forward ham bo'ladi).\n"
+        "Birinchi videodan keyin ✅ Tayyor tugmasi chiqadi.",
+        reply_markup=CANCEL_KB,
+    )
+
+
+@state("up_files")
+async def s_up_files(update, ctx, st):
+    m = update.message
+    up = ctx.user_data.get("up")
+    if not up:
+        return
+    if not (m.video or m.document):
+        await m.reply_text("Faqat video yuboring.")
+        return
+    try:
+        res = await ctx.bot.copy_message(CHANNEL_ID, m.chat_id, m.message_id)
+    except TelegramError as e:
+        await m.reply_text(f"❌ Baza kanalga joylab bo'lmadi: {e}\nBot kanalda admin ekanini tekshiring.")
+        return
+    up["ids"].append(res.message_id)
+    text, kb = up_view(up)
+    if up.get("status"):
+        try:
+            await ctx.bot.edit_message_text(
+                text, chat_id=m.chat_id, message_id=up["status"], parse_mode=HTML, reply_markup=kb
+            )
+            return
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+        except TelegramError:
+            pass
+    msg = await m.chat.send_message(text, parse_mode=HTML, reply_markup=kb)
+    up["status"] = msg.message_id
+
+
+async def cb_up(update, ctx, p):
+    a = p[1]
+    up = ctx.user_data.get("up")
+    if not up:
+        await v_movies(update)
+        return
+    if a == "cancel":
+        await up_cleanup(ctx.bot, up)
+        ctx.user_data.pop("up", None)
+        await v_movies(update)
+    elif a == "undo":
+        if up["ids"]:
+            mid = up["ids"].pop()
+            try:
+                await ctx.bot.delete_message(CHANNEL_ID, mid)
+            except TelegramError:
+                pass
+        ctx.user_data["st"] = {"k": "up_files"}
+        if up["ids"]:
+            text, kb = up_view(up)
+            up["status"] = update.callback_query.message.message_id
+            await show(update, text, kb)
+        else:
+            up["status"] = None
+            await show(update, "Hozircha video yo'q. Videolarni yuboring:", CANCEL_KB)
+    elif a == "done":
+        if not up["ids"]:
+            ctx.user_data["st"] = {"k": "up_files"}
+            await show(update, "Hali video yubormadingiz. Videolarni yuboring:", CANCEL_KB)
+            return
+        if up.get("code"):
+            code = up["code"]
+            m = movies.find_one({"code": code})
+            parts = movie_parts(m) + up["ids"] if m else up["ids"]
+            movies.update_one({"code": code}, {"$set": {"parts": parts}, "$unset": {"message_id": ""}})
+        else:
+            code = next_code()
+            parts = up["ids"]
+            movies.insert_one({"code": code, "title": up["title"], "parts": parts, "created": now()})
+        ctx.user_data.pop("up", None)
+        n = len(parts)
+        kind = f"Serial, {n} qism" if n > 1 else "Kino"
+        await show(
+            update,
+            f"✅ <b>Saqlandi</b>\n\nNomi: {esc(up['title'])}\nTuri: {kind}\nKod: <code>{code}</code>\n"
+            f"Havola: https://t.me/{BOT_USERNAME}?start={code}",
+            Markup(
+                [
+                    [Btn("🎬 Kino kartasi", callback_data=f"mv:c:{code}")],
+                    [Btn("➕ Yana qo'shish", callback_data="mv:add")],
+                    [Btn("◀️ Orqaga", callback_data="mv:home")],
+                ]
+            ),
+        )
 
 
 # ---------- Statistika ----------
@@ -1452,7 +1723,7 @@ async def cb_se(update, ctx, p):
 
 ROUTES = {
     "a": cb_a, "mv": cb_mv, "st": cb_st, "ch": cb_ch, "bc": cb_bc, "us": cb_us,
-    "ds": cb_ds, "se": cb_se, "pr": cb_pr, "ad": cb_ad, "po": cb_po,
+    "ds": cb_ds, "se": cb_se, "pr": cb_pr, "ad": cb_ad, "po": cb_po, "up": cb_up,
 }
 MIDFLOW = {"bc:skip", "bc:go", "po:skip", "po:go"}
 
@@ -1474,7 +1745,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_answer(q)
         code = int(d[2:])
         if await gate(update, ctx, code):
-            await deliver(ctx.bot, q.message.chat_id, uid, code, bool(doc.get("is_premium")))
+            await deliver(ctx, q.message.chat_id, uid, code, bool(doc.get("is_premium")))
         return
     if d.startswith("chk:"):
         code = int(d[4:] or 0)
@@ -1488,7 +1759,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except TelegramError:
             pass
         if code:
-            await deliver(ctx.bot, q.message.chat_id, uid, code, bool(doc.get("is_premium")))
+            await deliver(ctx, q.message.chat_id, uid, code, bool(doc.get("is_premium")))
         else:
             await send_start(ctx.bot, q.message.chat_id, uid)
         return
@@ -1512,6 +1783,8 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app):
+    global BOT_USERNAME
+    BOT_USERNAME = app.bot.username
     await app.bot.set_my_commands([("start", "Botni ishga tushirish")])
     log.info("Bot ishga tushdi: @%s", app.bot.username)
 
